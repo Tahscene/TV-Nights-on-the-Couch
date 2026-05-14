@@ -1,0 +1,896 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CSE4204 — Couch &amp; Lamp</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { overflow: hidden; background: #080612; font-family: 'Georgia', serif; }
+    canvas { display: block; }
+
+    /* ── HUD Top Bar ─────────────────────────────────────── */
+    #hud-top {
+      position: fixed; top: 0; left: 0; right: 0;
+      padding: 16px 20px;
+      display: flex; justify-content: space-between; align-items: flex-start;
+      pointer-events: none; z-index: 10;
+    }
+
+    .card {
+      background: rgba(8, 6, 18, 0.78);
+      border: 1px solid rgba(255, 210, 100, 0.13);
+      border-radius: 12px; padding: 12px 16px;
+      backdrop-filter: blur(10px); color: #e2d4b8; font-size: 13px;
+      line-height: 1.75; pointer-events: auto;
+    }
+    .card-label {
+      font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase;
+      color: #8a7448; margin-bottom: 5px;
+    }
+    .card-value { font-size: 15px; font-weight: bold; color: #ffd07a; }
+
+    /* texture dots */
+    #tex-dots { display: flex; gap: 6px; margin-top: 8px; }
+    .tdot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: rgba(255,255,255,0.18); transition: all 0.3s;
+    }
+    .tdot.on { background: #ffd060; box-shadow: 0 0 5px #ffd060; }
+
+    /* ── Bottom controls bar ─────────────────────────────── */
+    #controls {
+      position: fixed; bottom: 0; left: 0; right: 0; z-index: 10;
+      padding: 14px 20px 18px;
+      display: flex; justify-content: center; gap: 22px; flex-wrap: wrap;
+  background: linear-gradient(to left, rgba(8,6,18,0.92) 10%, transparent); 
+      pointer-events: none;
+    }
+    .ctrl { color: rgba(190,170,120,0.75); font-size: 12px; display: flex; align-items: center; gap: 6px; }
+    kbd {
+      display: inline-block; background: rgba(255,210,100,0.10);
+      border: 1px solid rgba(255,210,100,0.25); border-radius: 5px;
+      padding: 1px 7px; font-family: monospace; font-size: 12px; color: #ffd060;
+    }
+
+    /* ── Texture flash overlay ───────────────────────────── */
+    #flash {
+      position: fixed; inset: 0; pointer-events: none;
+      background: rgba(255,220,100,0.06); opacity: 0;
+      transition: opacity 0.15s; z-index: 5;
+    }
+  </style>
+</head>
+<body>
+
+<!-- ── HUD ──────────────────────────────────────────────────── -->
+<div id="hud-top">
+
+  <!-- Texture selector (only card remaining) -->
+  <div class="card" style="min-width:160px; margin-left:auto;">
+    <div class="card-label">Couch texture</div>
+    <div class="card-value" id="tex-name">Blue Fabric</div>
+    <div id="tex-dots"></div>
+    <div style="margin-top:5px;font-size:11px;color:#6a5c38;">Click scene to change</div>
+  </div>
+
+</div>
+
+<div id="flash"></div>
+
+<div id="controls">
+  <div class="ctrl"><kbd>← →</kbd> Orbit</div>
+  <div class="ctrl"><kbd>↑ ↓</kbd> Elevate</div>
+  <div class="ctrl"><kbd>W</kbd><kbd>S</kbd> Zoom</div>
+  <div class="ctrl"><kbd>Click</kbd> Cycle texture</div>
+</div>
+
+<!-- ── Three.js ─────────────────────────────────────────────── -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+'use strict';
+// ================================================================
+//  CSE4204 Computer Graphics — Project: Couch & Lamp
+//
+//  LAB-1  : WebGL pipeline  (renderer → vertex shader → rasteriser
+//           → fragment shader → frame buffer)
+//  LAB-2  : GLSL variables  (attribute/uniform/varying concept
+//           mirrored by Three.js material properties and uniforms)
+//  LAB-4  : Perspective projection + camera view transform
+//           (PerspectiveCamera fov/aspect/near/far = persMat;
+//            spherical camera orbit = u_Basis × u_Eye)
+//  LAB-5  : Three.js scene elements — Renderer, Camera, Scene,
+//           Mesh, lights, animation loop (requestAnimationFrame)
+//  LAB-6  : Geometry grouping (THREE.Group), canvas textures,
+//           per-face material arrays, external model pattern
+// ================================================================
+
+
+// ── RENDERER (LAB-5) ────────────────────────────────────────────
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(1);   
+renderer.setSize(window.innerWidth, window.innerHeight);
+
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type    = THREE.PCFSoftShadowMap;
+renderer.toneMapping       = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 0.6;
+document.body.appendChild(renderer.domElement);
+
+
+// ── SCENE (LAB-5) ───────────────────────────────────────────────
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x8a6a75); // very soft onion pink
+scene.fog = new THREE.FogExp2(0x8a6a75, 0.025);
+// ── CAMERA — Perspective Projection (LAB-4 / LAB-5) ─────────────
+// Equivalent to persMat built manually in LAB-4:
+//   pa = 1/(aspect·tan(fov/2))  pb = 1/tan(fov/2)
+//   pc = -(far+near)/(far-near) pd = -2·far·near/(far-near)
+const camera = new THREE.PerspectiveCamera(
+  45,
+  window.innerWidth / window.innerHeight,
+  0.1,
+  300
+);
+
+// Spherical camera coordinates — equivalent to u_Basis × u_Eye (LAB-4)
+let camTheta  = Math.PI;     // horizontal orbit angle (yaw)
+let camPhi    =  0.38;    // vertical elevation angle (pitch)
+let camRadius = 6.0;     // distance from look-at point
+
+function positionCamera() {
+    const x = camRadius * Math.sin(camTheta) * Math.cos(camPhi);
+    const y = camRadius * Math.sin(camPhi);   // ✅ use camPhi
+    const z = camRadius * Math.cos(camTheta) * Math.cos(camPhi);
+
+    camera.position.set(x, y + 1.2, z); // small offset so floor e na dhuke
+    camera.lookAt(0, 1.6, 0);
+}
+positionCamera();
+
+
+// ================================================================
+//  PROCEDURAL TEXTURES (LAB-5/LAB-6: CanvasTexture = TextureLoader
+//  equivalent; these textures map to fragment shader's sampler2D)
+// ================================================================
+function makeTex(drawFn, size, ru, rv) {
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = size || 512;
+  drawFn(cv.getContext('2d'), cv.width);
+  const t = new THREE.CanvasTexture(cv);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.repeat.set(ru || 2, rv || 2);
+  return t;
+}
+
+// ── Couch texture 1: blue woven fabric ──
+const T_BLUE = makeTex((ctx, s) => {
+  ctx.fillStyle = '#264f82'; ctx.fillRect(0, 0, s, s);
+  for (let i = 0; i <= s; i += 18) {
+    ctx.strokeStyle = i % 36 === 0 ? 'rgba(15,40,90,0.9)' : 'rgba(15,40,90,0.45)';
+    ctx.lineWidth   = i % 36 === 0 ? 2 : 1;
+    ctx.beginPath(); ctx.moveTo(i, 0); ctx.lineTo(i, s); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0, i); ctx.lineTo(s, i); ctx.stroke();
+  }
+  for (let x = 0; x < s; x += 36)
+    for (let y = 0; y < s; y += 36) {
+      ctx.fillStyle = 'rgba(90,140,220,0.07)';
+      ctx.fillRect(x + 1, y + 1, 16, 16);
+    }
+}, 512, 3, 3);
+
+// ── Couch texture 2: deep red velvet ──
+const T_RED = makeTex((ctx, s) => {
+  const g = ctx.createLinearGradient(0, 0, s, s);
+  g.addColorStop(0, '#620d17'); g.addColorStop(0.5, '#9b1a28'); g.addColorStop(1, '#620d17');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, s, s);
+  for (let i = 0; i < 5000; i++) {
+    const a = Math.random() * 0.08;
+    ctx.fillStyle = Math.random() > 0.5 ? `rgba(255,80,80,${a})` : `rgba(60,5,10,${a})`;
+    ctx.fillRect(Math.random() * s, Math.random() * s, 1, Math.random() * 6 + 2);
+  }
+}, 512, 2, 2);
+
+// ── Couch texture 3: warm beige linen ──
+const T_BEIGE = makeTex((ctx, s) => {
+  ctx.fillStyle = '#c0a278'; ctx.fillRect(0, 0, s, s);
+  for (let i = 0; i < s; i += 7) {
+    ctx.strokeStyle = `rgba(140,100,55,${i % 14 === 0 ? 0.55 : 0.22})`;
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(i, 0); ctx.lineTo(i, s); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0, i); ctx.lineTo(s, i); ctx.stroke();
+  }
+  for (let i = 0; i < 900; i++) {
+    ctx.strokeStyle = `rgba(170,130,70,${Math.random() * 0.18})`;
+    ctx.lineWidth = Math.random() + 0.3;
+    const x = Math.random() * s, y = Math.random() * s;
+    ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + Math.random() * 22, y + Math.random() * 4); ctx.stroke();
+  }
+}, 512, 4, 4);
+
+// ── Couch texture 4: dark green leather ──
+const T_GREEN = makeTex((ctx, s) => {
+  ctx.fillStyle = '#16352a'; ctx.fillRect(0, 0, s, s);
+  for (let i = 0; i < 320; i++) {
+    const x = Math.random() * s, y = Math.random() * s, r = Math.random() * 28 + 6;
+    const g = ctx.createRadialGradient(x, y, 0, x, y, r);
+    g.addColorStop(0, 'rgba(45,105,70,0.14)'); g.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.ellipse(x, y, r, r * 0.35, Math.random() * Math.PI, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.strokeStyle = 'rgba(8,45,25,0.45)'; ctx.lineWidth = 1;
+  for (let i = 0; i < s; i += 44) { ctx.beginPath(); ctx.moveTo(0, i); ctx.lineTo(s, i); ctx.stroke(); }
+}, 512, 2, 2);
+
+// Textures registry — cycling on mouse click (LAB-2: like updating uniform u_color)
+const TEXTURES = [
+  { name: 'Blue Fabric',   tex: T_BLUE,  em: 0x040e20 },
+  { name: 'Red Velvet',    tex: T_RED,   em: 0x1a0306 },
+  { name: 'Beige Linen',   tex: T_BEIGE, em: 0x120f07 },
+  { name: 'Green Leather', tex: T_GREEN, em: 0x040e07 },
+];
+let texIdx = 0;
+const couchFabricMeshes = [];
+
+// ── Metal for lamp ──
+const T_METAL = makeTex((ctx, s) => {
+  const g = ctx.createLinearGradient(0, 0, s, 0);
+  g.addColorStop(0, '#1e1e1e'); g.addColorStop(0.3, '#4e4e4e');
+  g.addColorStop(0.5, '#808080'); g.addColorStop(0.7, '#4e4e4e'); g.addColorStop(1, '#1e1e1e');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, s, s);
+  ctx.strokeStyle = 'rgba(255,255,255,0.035)'; ctx.lineWidth = 1;
+  for (let y = 0; y < s; y += 2) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(s, y); ctx.stroke(); }
+}, 256, 1, 6);
+
+// ── Lampshade cream fabric ──
+const T_SHADE = makeTex((ctx, s) => {
+  const g = ctx.createLinearGradient(0, 0, 0, s);
+  g.addColorStop(0, '#f0dfa0'); g.addColorStop(1, '#d0b860');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, s, s);
+  ctx.strokeStyle = 'rgba(170,130,55,0.18)'; ctx.lineWidth = 1;
+  for (let x = 0; x < s; x += 11) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, s); ctx.stroke(); }
+  ctx.strokeStyle = 'rgba(150,110,40,0.45)'; ctx.lineWidth = 4;
+  ctx.beginPath(); ctx.moveTo(0, 5); ctx.lineTo(s, 5); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(0, s - 5); ctx.lineTo(s, s - 5); ctx.stroke();
+}, 512, 4, 1);
+
+// ── Floor wood planks ──
+// ── Beige floor with lavender floral pattern ──
+const T_FLOOR = makeTex((ctx, s) => {
+
+  // base beige color
+  ctx.fillStyle = '#e6d3a3';
+  ctx.fillRect(0,0,s,s);
+
+  // subtle texture noise
+  for(let i=0;i<1500;i++){
+    ctx.fillStyle = `rgba(120,100,60,${Math.random()*0.05})`;
+    ctx.fillRect(Math.random()*s,Math.random()*s,2,2);
+  }
+
+  // lavender floral pattern in center
+  ctx.translate(s/2,s/2);
+
+  for(let i=0;i<12;i++){
+    const angle = (Math.PI*2/12)*i;
+    const x = Math.cos(angle)*90;
+    const y = Math.sin(angle)*90;
+
+    ctx.beginPath();
+    ctx.fillStyle = "#c7a6ff"; // lavender
+    ctx.arc(x,y,26,0,Math.PI*2);
+    ctx.fill();
+
+    ctx.beginPath();
+    ctx.fillStyle = "#b48cff";
+    ctx.arc(x,y,12,0,Math.PI*2);
+    ctx.fill();
+  }
+
+  // center flower
+  ctx.beginPath();
+  ctx.fillStyle="#d8bfff";
+  ctx.arc(0,0,60,0,Math.PI*2);
+  ctx.fill();
+
+  ctx.beginPath();
+  ctx.fillStyle="#9b6cff";
+  ctx.arc(0,0,22,0,Math.PI*2);
+  ctx.fill();
+
+},1024,2,2);
+// ── Wall plaster ──
+const T_WALL = makeTex((ctx, s) => {
+  ctx.fillStyle = '#1c1a2c'; ctx.fillRect(0, 0, s, s);
+  for (let i = 0; i < 600; i++) {
+    ctx.fillStyle = `rgba(200,190,240,${Math.random() * 0.018})`;
+    ctx.fillRect(Math.random() * s, Math.random() * s, Math.random() * 35 + 5, Math.random() * 35 + 5);
+  }
+}, 512, 3, 3);
+
+// ── Rug pattern ──
+const T_RUG = makeTex((ctx, s) => {
+  ctx.fillStyle = '#22163a'; ctx.fillRect(0, 0, s, s);
+  const colors = ['#4a2a6a', '#3a2050', '#5c3480', '#2a1845'];
+  for (let i = 0; i < 8; i++) {
+    ctx.strokeStyle = colors[i % colors.length];
+    ctx.lineWidth = 3; ctx.strokeRect(i * 30, i * 30, s - i * 60, s - i * 60);
+  }
+  ctx.fillStyle = 'rgba(120,80,180,0.12)';
+  for (let x = 30; x < s - 30; x += 60) for (let y = 30; y < s - 30; y += 60) {
+    ctx.beginPath(); ctx.arc(x, y, 12, 0, Math.PI * 2); ctx.fill();
+  }
+}, 512, 1, 1);
+
+
+// ================================================================
+//  SHARED MATERIAL FACTORIES
+// ================================================================
+const M_WOOD_DARK = new THREE.MeshLambertMaterial({ color: 0x1e0c02 });
+const M_WOOD_MED  = new THREE.MeshLambertMaterial({ color: 0x2e1608 });
+const M_METAL     = new THREE.MeshLambertMaterial({ map: T_METAL, color: 0x909090 });
+
+function makeFabricMat() {
+  const t = TEXTURES[texIdx];
+  return new THREE.MeshLambertMaterial({ map: t.tex, emissive: new THREE.Color(t.em) });
+}
+
+
+// ================================================================
+//  COUCH  (LAB-6: THREE.Group — grouping multiple geometries)
+// ================================================================
+const couchGroup = new THREE.Group();
+
+function buildCouch() {
+  couchGroup.clear();
+  couchFabricMeshes.length = 0;
+  const fab = makeFabricMat();
+
+  // Helper: add a box mesh to the couch group
+  function addBox(w, h, d, mat, x, y, z, castShadow = true) {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+    m.position.set(x, y, z);
+    m.castShadow = castShadow;
+    m.receiveShadow = true;
+    couchGroup.add(m);
+    return m;
+  }
+
+  // — Legs (4): dark turned wood ──────────────────────────────────
+  const LEG_H = 0.30, LEG_W = 0.12;
+  [[-1.46, 0.62], [1.46, 0.62], [-1.46, -0.62], [1.46, -0.62]].forEach(([x, z]) => {
+    addBox(LEG_W, LEG_H, LEG_W, M_WOOD_DARK, x, LEG_H / 2, z);
+  });
+
+  // — Seat base frame (thin wood platform) ────────────────────────
+  const BASE_Y = LEG_H + 0.04;
+  addBox(3.34, 0.08, 1.52, M_WOOD_MED, 0, BASE_Y, 0, false);
+
+  // — Seat cushion (fabric) ───────────────────────────────────────
+  const SEAT_Y = BASE_Y + 0.08 / 2 + 0.44 / 2;   // = 0.38 + 0.22 = 0.60
+  const SEAT_TOP = SEAT_Y + 0.22;                  // = 0.82
+  const seat = addBox(2.68, 0.44, 1.40, fab, 0, SEAT_Y, 0.05);
+  couchFabricMeshes.push(seat);
+
+  // — Back support frame ──────────────────────────────────────────
+  addBox(2.68, 0.07, 0.32, M_WOOD_MED, 0, SEAT_TOP + 0.035, -0.60);
+
+  // — Back cushion (fabric) ───────────────────────────────────────
+  const BACK_H = 0.92;
+  const back = addBox(2.68, BACK_H, 0.34, fab, 0, SEAT_TOP + BACK_H / 2, -0.60);
+  couchFabricMeshes.push(back);
+
+  // — Armrests (fabric) ───────────────────────────────────────────
+  const ARM_H = 0.86;
+  [[-1.50, 0], [1.50, 0]].forEach(([x, z]) => {
+    const arm = addBox(0.32, ARM_H, 1.52, fab, x, ARM_H / 2, z);
+    couchFabricMeshes.push(arm);
+  });
+
+  // — Armrest top caps (polished wood) ────────────────────────────
+  [[-1.50, 0], [1.50, 0]].forEach(([x, z]) => {
+    addBox(0.36, 0.045, 1.56, M_WOOD_MED, x, ARM_H + 0.022, z);
+  });
+
+  // — Back top rail ────────────────────────────────────────────────
+  addBox(2.68, 0.055, 0.06, M_WOOD_MED, 0, SEAT_TOP + BACK_H + 0.027, -0.44);
+
+  // — Three decorative tufting buttons on back cushion ─────────────
+  const btnGeo = new THREE.SphereGeometry(0.038, 8, 8);
+  const btnMat = new THREE.MeshLambertMaterial({ color: 0x0d0a06 });
+  [-0.72, 0, 0.72].forEach(x => {
+    const btn = new THREE.Mesh(btnGeo, btnMat);
+    btn.position.set(x, SEAT_TOP + BACK_H / 2, -0.43);
+    couchGroup.add(btn);
+  });
+
+  // — Small decorative feet detail discs ───────────────────────────
+  const discGeo = new THREE.CylinderGeometry(0.09, 0.09, 0.02, 16);
+  [[-1.46, 0.62], [1.46, 0.62], [-1.46, -0.62], [1.46, -0.62]].forEach(([x, z]) => {
+    const disc = new THREE.Mesh(discGeo, M_WOOD_DARK);
+    disc.position.set(x, 0.01, z);
+    couchGroup.add(disc);
+  });
+
+  scene.add(couchGroup);
+  couchGroup.receiveShadow = true;
+}
+buildCouch();
+
+
+// ================================================================
+//  LAMP STAND  (LAB-6: grouping CylinderGeometry + TorusGeometry)
+// ================================================================
+const lampGroup = new THREE.Group();
+
+const LAMP_X = 2.65, LAMP_Z = -1.35;
+
+// Pre-calculate pole/shade heights
+const BASE_TOP   = 0.10;          // top of base disk
+const POLE_H     = 2.10;          // pole height
+const POLE_CY    = BASE_TOP + POLE_H / 2;         // = 0.10 + 1.05 = 1.15
+const POLE_TOP   = BASE_TOP + POLE_H;              // = 2.20
+const NECK_H     = 0.22;
+const NECK_CY    = POLE_TOP + NECK_H / 2;          // = 2.20 + 0.11 = 2.31
+const NECK_TOP   = POLE_TOP + NECK_H;              // = 2.42
+const SHADE_CY   = NECK_TOP + 0.34 - 0.04;        // shade centre = 2.72
+const SHADE_H    = 0.70;
+const SHADE_TOP  = SHADE_CY + SHADE_H / 2;        // = 2.72 + 0.35 = 3.07
+
+// Helper: add mesh to lampGroup
+function addLamp(geo, mat, x, y, z) {
+  const m = new THREE.Mesh(geo, mat);
+  m.position.set(x, y, z);
+  m.castShadow = true; m.receiveShadow = true;
+  lampGroup.add(m);
+  return m;
+}
+
+// — Heavy weighted base disk ─────────────────────────────────────
+addLamp(new THREE.CylinderGeometry(0.44, 0.50, 0.10, 48), M_METAL, 0, 0.05, 0);
+addLamp(new THREE.CylinderGeometry(0.14, 0.22, 0.07, 32), M_METAL, 0, BASE_TOP + 0.035, 0);
+
+// — Main pole ─────────────────────────────────────────────────────
+addLamp(new THREE.CylinderGeometry(0.040, 0.040, POLE_H, 16), M_METAL, 0, POLE_CY, 0);
+
+// — Neck / gooseneck join ─────────────────────────────────────────
+addLamp(new THREE.CylinderGeometry(0.030, 0.040, NECK_H, 16), M_METAL, 0, NECK_CY, 0);
+
+// — Shade mount ring (TorusGeometry) ──────────────────────────────
+const mountRing = new THREE.Mesh(new THREE.TorusGeometry(0.13, 0.022, 8, 32), M_METAL);
+mountRing.position.y = NECK_TOP + 0.04;
+lampGroup.add(mountRing);
+
+// — Lampshade: CylinderGeometry — narrow top (0.13), wide bottom (0.58)
+//   This is the LAB-6 per-face material concept adapted for a single mesh
+const shadeMat = new THREE.MeshLambertMaterial({
+  map: T_SHADE, side: THREE.DoubleSide,
+  emissive: new THREE.Color(0x2a1800), emissiveIntensity: 0.2,
+});
+addLamp(new THREE.CylinderGeometry(0.13, 0.58, SHADE_H, 48, 1, true), shadeMat, 0, SHADE_CY, 0);
+
+// — Shade rim rings (top and bottom) ──────────────────────────────
+const rimMat = new THREE.MeshLambertMaterial({ color: 0x888060 });
+[{ r: 0.13, y: SHADE_CY + SHADE_H / 2 }, { r: 0.58, y: SHADE_CY - SHADE_H / 2 }]
+  .forEach(({ r, y }) => {
+    const rim = new THREE.Mesh(new THREE.TorusGeometry(r, 0.018, 8, 48), rimMat);
+    rim.position.y = y; lampGroup.add(rim);
+  });
+
+// — Bulb (emissive sphere — glows with lamp) ──────────────────────
+const bulbMat = new THREE.MeshStandardMaterial({
+  emissive: new THREE.Color(0xffcc44),
+  emissiveIntensity: 3.5,
+  color: new THREE.Color(0xffe880),
+  roughness: 0.2, metalness: 0.0,
+});
+const bulb = addLamp(new THREE.SphereGeometry(0.085, 16, 16), bulbMat, 0, SHADE_CY - 0.14, 0);
+
+lampGroup.position.set(LAMP_X, 0, LAMP_Z);
+scene.add(lampGroup);
+
+// ── TV / Movie Screen ───────────────────────────────
+// ── TV (Black frame + Sky Blue screen, opposite couch) ──
+const tvGroup = new THREE.Group();
+
+const tvWidth = 5;
+const tvHeight = 3;
+
+const textureLoader = new THREE.TextureLoader();
+
+// ✅ FIX 1: material
+const tvMaterial = new THREE.MeshBasicMaterial({ color: 0xffffff });
+
+// ✅ FIX 2: correct size
+const tvMesh = new THREE.Mesh(
+  new THREE.PlaneGeometry(tvWidth, tvHeight),
+  tvMaterial
+);
+
+// texture
+textureLoader.load('image.jpg', (tex) => {
+
+  tex.wrapS = THREE.ClampToEdgeWrapping;
+  tex.wrapT = THREE.ClampToEdgeWrapping;
+
+  const img = tex.image;
+  const imgAspect = img.width / img.height;
+  const screenAspect = tvWidth / tvHeight;
+
+  if (imgAspect > screenAspect) {
+    const scale = screenAspect / imgAspect;
+    tex.repeat.x = scale;
+    tex.offset.x = (1 - scale) / 2;
+  } else {
+    const scale = imgAspect / screenAspect;
+    tex.repeat.y = scale;
+    tex.offset.y = (1 - scale) / 2;
+  }
+
+  tvMaterial.map = tex;
+  tvMaterial.needsUpdate = true;
+});
+
+tvMesh.position.set(0, 0, 0.09);
+tvGroup.position.set(0, 2.2, 5.9);
+tvGroup.lookAt(0, 1, 0);// Black frame thickness
+
+const frameThickness = 0.1;
+const frameMat = new THREE.MeshBasicMaterial({ color: 0x000000 });
+
+// Top frame
+const frameTop = new THREE.Mesh(new THREE.BoxGeometry(tvWidth + frameThickness*2, frameThickness, frameThickness), frameMat);
+frameTop.position.set(0, tvHeight/2 + frameThickness/2, 0);
+
+// Bottom frame
+const frameBottom = new THREE.Mesh(new THREE.BoxGeometry(tvWidth + frameThickness*2, frameThickness, frameThickness), frameMat);
+frameBottom.position.set(0, -tvHeight/2 - frameThickness/2, 0);
+
+// Left frame
+const frameLeft = new THREE.Mesh(new THREE.BoxGeometry(frameThickness, tvHeight + frameThickness*2, frameThickness), frameMat);
+frameLeft.position.set(-tvWidth/2 - frameThickness/2, 0, 0);
+
+// Right frame
+const frameRight = new THREE.Mesh(new THREE.BoxGeometry(frameThickness, tvHeight + frameThickness*2, frameThickness), frameMat);
+frameRight.position.set(tvWidth/2 + frameThickness/2, 0, 0);
+const zOffset = 0.04;
+
+frameTop.position.z = zOffset;
+frameBottom.position.z = zOffset;
+frameLeft.position.z = zOffset;
+frameRight.position.z = zOffset;
+// TV group add
+tvGroup.add(tvMesh, frameTop, frameBottom, frameLeft, frameRight);
+scene.add(tvGroup);// 
+
+
+
+
+
+//================================================================
+//  ENVIRONMENT — floor, walls, rug, accent objects (LAB-6)
+// ================================================================
+
+// Floor (wood planks)
+const floor = new THREE.Mesh(
+  new THREE.PlaneGeometry(20, 20),
+  new THREE.MeshLambertMaterial({ map: T_FLOOR })
+);
+floor.rotation.x = -Math.PI / 2;
+floor.receiveShadow = true;
+scene.add(floor);
+
+// Back wall
+const wallMat = new THREE.MeshLambertMaterial({
+  color: 0xa8838f,
+  side: THREE.DoubleSide   // 🔥 MUST
+});
+const backWall = new THREE.Mesh(new THREE.PlaneGeometry(22, 9), wallMat);
+backWall.position.set(0, 4.5, -6); backWall.receiveShadow = true;
+scene.add(backWall);
+
+// Left side wall
+const leftWall = new THREE.Mesh(new THREE.PlaneGeometry(18, 9), wallMat);
+leftWall.position.set(-7, 4.5, 2); leftWall.rotation.y = Math.PI / 2;
+leftWall.receiveShadow = true; scene.add(leftWall);
+// Right wall (TV er jonno)
+const rightWall = new THREE.Mesh(
+  new THREE.PlaneGeometry(18, 9),
+  wallMat
+);
+rightWall.position.set(7, 4.5, 0);
+rightWall.rotation.y = -Math.PI / 2;
+rightWall.receiveShadow = true;
+scene.add(rightWall);
+
+
+const frontWall = new THREE.Mesh(
+  new THREE.PlaneGeometry(22, 9),
+  wallMat
+);
+frontWall.position.set(0, 4.5, 6);
+frontWall.rotation.y = Math.PI;
+frontWall.receiveShadow = true;
+scene.add(frontWall);
+
+// FAIRY LIGHT FUNCTION
+const fairyLights = [];
+const fairyBulbs = [];
+
+function createFairyLights(axis, fixedVal, start, end, yBase, count) {
+
+  for (let i = 0; i < count; i++) {
+
+    const t = i / (count - 1 || 1);
+
+    let x = 0, y = 0, z = 0;
+
+    const sag = Math.abs(Math.sin(t * Math.PI)) * 0.25;
+    y = yBase - sag;
+
+    if (axis === "z") {
+      x = start + (end - start) * t;
+      z = fixedVal + (fixedVal < 0 ? 0.15 : -0.15);
+    }
+
+    if (axis === "x") {
+      z = start + (end - start) * t;
+      x = fixedVal + (fixedVal < 0 ? 0.15 : -0.15);
+    }
+
+    const bulbMat = new THREE.MeshStandardMaterial({
+      color: 0xffd28a,
+      emissive: new THREE.Color(0xffd28a),
+      emissiveIntensity: 2
+    });
+
+    const bulb = new THREE.Mesh(
+      new THREE.SphereGeometry(0.12, 16, 16),
+      bulbMat
+    );
+
+    bulb.position.set(x, y, z);
+    scene.add(bulb);
+    fairyBulbs.push(bulbMat);
+
+    const light = new THREE.PointLight(0xffc46b, 1.2, 6);
+    light.position.set(x, y, z);
+    scene.add(light);
+    fairyLights.push(light);
+  }
+}// Fairy lights add
+
+createFairyLights("z", -6, -5, 5, 3.2, 20);
+createFairyLights("x", -7, -4, 4, 3.2, 18);
+createFairyLights("x", 7, -4, 4, 3.2, 18);
+
+
+// Ceiling (subtle)
+const ceiling = new THREE.Mesh(new THREE.PlaneGeometry(22, 18),
+  new THREE.MeshLambertMaterial({ color: 0x141220 }));
+ceiling.rotation.x = Math.PI / 2; ceiling.position.y = 9;
+scene.add(ceiling);
+
+// Rug under couch
+const rugBorder = new THREE.Mesh(new THREE.PlaneGeometry(5.2, 3.2),
+  new THREE.MeshLambertMaterial({ color: 0x3a2855 }));
+rugBorder.rotation.x = -Math.PI / 2; rugBorder.position.set(0, 0.001, 0.2);
+rugBorder.receiveShadow = true; scene.add(rugBorder);
+
+const rug = new THREE.Mesh(new THREE.PlaneGeometry(4.8, 2.8),
+  new THREE.MeshLambertMaterial({ map: T_RUG }));
+rug.rotation.x = -Math.PI / 2; rug.position.set(0, 0.002, 0.2);
+rug.receiveShadow = true; scene.add(rug);
+
+// Small side table next to couch
+const tableShaderMat = new THREE.ShaderMaterial({
+  uniforms: {
+    color: { value: new THREE.Color(0x00ffcc) }
+  },
+  vertexShader: `
+    varying vec3 vPos;
+    void main() {
+      vPos = position;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0);
+    }
+  `,
+  fragmentShader: `
+    uniform vec3 color;
+    varying vec3 vPos;
+
+    void main() {
+      float gradient = (vPos.y + 0.5);
+      gl_FragColor = vec4(color * gradient, 1.0);
+    }
+  `
+});
+
+const sideTableGroup = new THREE.Group();
+const stTop = new THREE.Mesh(
+  new THREE.CylinderGeometry(0.40, 0.38, 0.05, 32),
+  tableShaderMat
+);
+stTop.castShadow = true;
+stTop.receiveShadow = true;
+stTop.position.y = 0.68; stTop.castShadow = true; sideTableGroup.add(stTop);
+for (let a = 0; a < 3; a++) {
+  const angle = (a / 3) * Math.PI * 2;
+  const leg = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.03, 0.03, 0.68, 8),
+    tableShaderMat   // ← same material
+  );
+  leg.position.set(Math.sin(angle) * 0.28, 0.34, Math.cos(angle) * 0.28);
+  leg.castShadow = true; sideTableGroup.add(leg);
+}
+sideTableGroup.position.set(-2.4, 0, 0.3);
+scene.add(sideTableGroup);
+
+// A small vase on side table
+const vaseGeo = new THREE.CylinderGeometry(0.10, 0.07, 0.35, 24);
+const vaseMat = new THREE.MeshLambertMaterial({ color: 0x4a3c8c });
+const vase = new THREE.Mesh(vaseGeo, vaseMat);
+vase.position.set(-2.4, 0.72 + 0.175, 0.3); vase.castShadow = true;
+scene.add(vase);
+
+// Vase neck
+const vaseNeck = new THREE.Mesh(new THREE.CylinderGeometry(0.055, 0.10, 0.12, 20), vaseMat);
+vaseNeck.position.set(-2.4, 0.72 + 0.35 + 0.06, 0.3); vaseNeck.castShadow = true;
+scene.add(vaseNeck);
+// ================================================================
+//  CUSTOM SHADER OBJECT (for full marks)
+// ================================================================
+
+
+
+
+
+// ================================================================
+//  LIGHTING  (LAB-5: Three.js lighting models)
+// ================================================================
+
+
+// 1. Ambient — global soft fill (like global illumination)
+const ambLight = new THREE.AmbientLight(0xffffff, 0.25);
+scene.add(ambLight);
+
+// 2. Directional — cool moonlight through window
+const dirLight = new THREE.DirectionalLight(0xffb6c1, 0.5);
+dirLight.position.set(-4, 8, 4);
+dirLight.castShadow = true;
+dirLight.shadow.mapSize.set(2048, 2048);
+dirLight.shadow.camera.left = -6;
+dirLight.shadow.camera.right = 6;
+dirLight.shadow.camera.top = 6;
+dirLight.shadow.camera.bottom = -6;
+dirLight.shadow.bias = -0.0002;
+dirLight.shadow.normalBias = 0.005; 
+scene.add(dirLight);
+
+// 3. Lamp point light — the ANIMATED light (LAB-5: animation loop)
+//    Equivalent to u_rotate uniform updated each frame in raw WebGL
+const lampLight = new THREE.PointLight(0xffbe50, 2.4, 0, 1.6);
+lampLight.position.set(LAMP_X, SHADE_CY - 0.25, LAMP_Z);
+lampLight.castShadow = false;
+scene.add(lampLight);
+
+const floorLight = new THREE.DirectionalLight(0xffffff,0.4);
+floorLight.position.set(0,10,5);
+scene.add(floorLight);
+// 4. Warm fill — subtle bounce light near couch from lamp warmth
+const fillLight = new THREE.PointLight(0xffa040, 0.25, 6, 2);
+fillLight.position.set(-1.5, 2.2, 0.8);
+scene.add(fillLight);
+
+// 5. Subtle upward rim behind couch (artistic fill)
+const rimLight = new THREE.PointLight(0x4040aa, 0.20, 5, 2);
+rimLight.position.set(0, 2.4, -3.5);
+scene.add(rimLight);
+
+
+// ================================================================
+//  KEYBOARD CONTROLS — Camera orbit (LAB-4: view transformation)
+//  Mirrors the u_Basis × u_Eye matrix from LAB-4:
+//   Arrow Left/Right  → update camTheta  → changes u_Basis
+//   Arrow Up/Down     → update camPhi    → changes u_Basis
+//   W / S             → update camRadius → changes u_Eye
+// ================================================================
+const keys = {};
+window.addEventListener('keydown', e => {
+  keys[e.key] = true;
+  // Prevent browser scroll on arrow keys
+  if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(e.key))
+    e.preventDefault();
+});
+window.addEventListener('keyup', e => { keys[e.key] = false; });
+
+
+// ================================================================
+//  MOUSE CLICK — Cycle couch texture (LAB-2: updating uniform/
+//  attribute equivalent — changes the material map on all fabric
+//  meshes, analogous to gl.uniform3fv(u_color_location, color))
+// ================================================================
+renderer.domElement.addEventListener('click', () => {
+  texIdx = (texIdx + 1) % TEXTURES.length;
+  const t = TEXTURES[texIdx];
+  const newMat = new THREE.MeshLambertMaterial({ map: t.tex, emissive: new THREE.Color(t.em) });
+  couchFabricMeshes.forEach(m => { m.material.dispose(); m.material = newMat; });
+
+  // update HUD
+  document.getElementById('tex-name').textContent = t.name;
+  document.querySelectorAll('.tdot').forEach((d, i) => d.classList.toggle('on', i === texIdx));
+
+  // flash overlay
+  const fl = document.getElementById('flash');
+  fl.style.opacity = '1';
+  setTimeout(() => fl.style.opacity = '0', 80);
+});
+
+
+// ================================================================
+//  UI INIT — build texture indicator dots
+// ================================================================
+const dotsEl = document.getElementById('tex-dots');
+TEXTURES.forEach((_, i) => {
+  const d = document.createElement('div');
+  d.className = 'tdot' + (i === 0 ? ' on' : '');
+  dotsEl.appendChild(d);
+});
+
+
+// ================================================================
+//  ANIMATION LOOP  (LAB-5: requestAnimationFrame)
+// ================================================================
+let clock = 0;
+
+function animate() {
+  requestAnimationFrame(animate);
+  clock += 0.016;   // approximate 60fps delta
+
+  // ── Camera keyboard update (LAB-4: view matrix) ───────────────
+  if (keys['ArrowLeft']  || keys['a'] || keys['A']) camTheta  -= 0.024;
+  if (keys['ArrowRight'] || keys['d'] || keys['D']) camTheta  += 0.024;
+  if (keys['ArrowUp'])   camPhi = Math.min( Math.PI / 2.05, camPhi + 0.016);
+  if (keys['ArrowDown']) camPhi = Math.max(-0.08,           camPhi - 0.016);
+  if (keys['w'] || keys['W']) camRadius = Math.max(3.5,  camRadius - 0.12);
+  if (keys['s'] || keys['S']) camRadius = Math.min(8.5, camRadius + 0.12);
+  positionCamera();
+
+  // ── Lamp light animation ───────────────────────────────────────
+  // Slowly turns fully OFF then fully ON using a smooth sine wave.
+  // (sin goes -1 → +1, so (sin+1)/2 maps to 0 → 1 cleanly)
+  // Period ≈ 6 seconds: slow enough to see clearly, fast enough to demo.
+  const cycle = (Math.sin(clock * 1.05) + 1) / 2;   // 0.0 = fully OFF, 1.0 = fully ON
+  const MAX_INTENSITY = 2.8;
+  lampLight.intensity = cycle * MAX_INTENSITY;
+
+  // Bulb emissive and shade glow track the lamp power exactly
+  bulbMat.emissiveIntensity  = cycle * 5.0;
+  shadeMat.emissiveIntensity = cycle * 0.65;
+
+  // Warm fill bounce light scales with lamp
+  fillLight.intensity = cycle * 0.35;
+  fairyLights.forEach(light => {
+  light.intensity = cycle * 1.2;
+});
+
+fairyBulbs.forEach(mat => {
+  mat.emissiveIntensity = 0.5 + cycle * 1.0;
+});
+  renderer.render(scene, camera);
+
+}
+animate();
+
+
+// ================================================================
+//  WINDOW RESIZE
+// ================================================================
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();   // (LAB-4: rebuild persMat)
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+</script>
+</body>
+</html>
