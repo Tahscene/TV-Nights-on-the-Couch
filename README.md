@@ -14,3 +14,6 @@ features:
 ● The texture of the couch will dynamically change based on interaction
 ● The lamp light will gradually turn on and off, creating a smooth animation effect
 The Project Report: 
+
+Screenshots: https://github.com/Tahscene/TV-Nights-on-the-Couch/blob/58117a851f3234ee5f2a2c7fdb6d7e83f78fca2d/Screenshot%202026-04-06%20212654.png
+
